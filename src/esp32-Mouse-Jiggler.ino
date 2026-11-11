@@ -17,9 +17,8 @@
 
   Touch: CST226SE at 0x5A, with CST816 at 0x15 as a fallback. Reset is GPIO13.
 
-  VID/PID note:
-  • usbdev.VID()/PID() may not override on all core versions at runtime.
-    If you need an exact VID/PID, you might have to hard-code it in the core’s USB.cpp.
+  based on https://github.com/rithwikmakesthings/esp32s3-Mouse-Jiggler/
+
 */
 
 #include <Arduino.h>
