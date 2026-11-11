@@ -1,51 +1,51 @@
+# ESP32 Mouse Jiggler
 
-# Main documentation page for T-Display S3 Pro
+USB mouse jiggler for the [LilyGO T-Display-S3 Pro](https://wiki.lilygo.cc/products/t-display-series/t-display-s3-pro/). The board enumerates as a HID mouse, moves the pointer a few pixels and back, and shows what it is doing on the 2.33 inch panel.
 
-https://wiki.lilygo.cc/products/t-display-series/t-display-s3-pro/
+Based on [rithwikmakesthings/esp32s3-Mouse-Jiggler](https://github.com/rithwikmakesthings/esp32s3-Mouse-Jiggler/).
 
+## What it does
 
-# T-Display S3 Pro References (quick start)
+- **Jiggle** eases 10–20 px out and back on one axis every 30–90 seconds, for up to 8 hours.
+- **Nudge** draws a 40 px square around the pointer and returns to the start.
+- The status line shows the countdown, HID reports sent, finished jiggles, and the current nudge side.
+- The red-circle touch key toggles the backlight. Jiggling keeps running while the panel is dark.
+- **USB** disconnects and reconnects the mouse. The host sees a Dell Laser Mouse MS3220.
 
-## Required Libraries
+## Build and flash
 
-Copy the project `lib/` directory to your Arduino libraries folder, or install the libraries below:
+[PlatformIO](https://platformio.org/) with the pioarduino ESP32 Arduino 3.x platform. LovyanGFX is fetched automatically. The CST226 touch driver is the SensorLib copy in `lib/SensorLib`.
 
-| Library | Version | Source |
-| :-----: | :-----: | :----: |
-| LovyanGFX | Latest | [GitHub](https://github.com/lovyan03/LovyanGFX) |
-| LilyGo-display-library | Latest | [Xinyuan-LilyGO/LilyGo-display-library](https://github.com/Xinyuan-LilyGO/LilyGo-display-library) |
-| LVGL | 8.x | [GitHub](https://github.com/lvgl/lvgl) |
-| XPowersLib | Latest | [GitHub](https://github.com/lewisxhe/XPowersLib) |
-| SensorLib | Latest | [GitHub](https://github.com/lewisxhe/SensorLib) |
-| TouchLib | Latest | [GitHub](https://github.com/mmMicky/TouchLib) |
-| JPEGDEC | Latest | [GitHub](https://github.com/bitbank2/JPEGDEC) |
+```bash
+pio run -e jiggler -t upload
+```
 
----
+| Environment | USB | Upload |
+| --- | --- | --- |
+| `jiggler` (default) | HID mouse, no serial port | Hold **BOOT**, tap **RESET**, release **BOOT**, then upload |
+| `jiggler-debug` | HID mouse plus serial at 115200 | Upload can auto-reset. **USB** disconnect also drops that serial port |
 
-## Arduino
+`jiggler-debug`:
 
-### PlatformIO (Recommended)
+```bash
+pio run -e jiggler-debug -t upload
+```
 
-1. Install [VS Code](https://code.visualstudio.com/) and the **PlatformIO IDE** extension
-2. Clone the repository:
-   ```bash
-   git clone https://github.com/Xinyuan-LilyGO/T-Display-S3-Pro.git
-   ```
-3. Open `platformio.ini` and enable one target example
-4. Build, connect via USB-C, then upload
+Open the serial monitor at 115200 on the debug build. The sketch itself does not print a log; the port is there so the host can reset the board.
 
-### Arduino IDE
+## Hardware
 
-| Setting | Value |
-| :-----: | :---: |
-| Board | **ESP32S3 Dev Module** |
-| Upload Speed | 921600 |
-| USB Mode | **Hardware CDC and JTAG** |
-| USB CDC On Boot | **Enabled** |
-| CPU Frequency | **240 MHz (WiFi)** |
-| Flash Mode | **QIO 80 MHz** |
-| Flash Size | **16 MB (128Mb)** |
-| Partition Scheme | **16M Flash (3MB APP/9.9MB FATFS)** |
-| PSRAM | **OPI PSRAM** |
+LilyGO T-Display-S3 Pro: ESP32-S3R8, 16 MB flash, 8 MB PSRAM, ST7796 222×480.
 
-> Set **USB CDC On Boot** to **Disabled** when running from battery only.
+| Function | Pin |
+| --- | --- |
+| TFT SPI | SCK 18, MOSI 17, MISO 8, CS 39, DC 9, RST 47 |
+| Backlight | 48 (V1.1 is a 16-step pulse pin) |
+| Touch and SY6970 | SDA 5, SCL 6, touch reset 13, IRQ 21 |
+| Buttons | BOOT 0, 12, 16 |
+
+The panel is wired in the sketch. Do not substitute the non-Pro variant pin macros. USB HID needs USB-OTG (`ARDUINO_USB_MODE=0`). The board manifest sets Hardware CDC; `platformio.ini` removes that flag.
+
+## Tuning
+
+Distances, pauses, and the 8 hour limit are the `kJiggle*` and `kHoursToRun` constants at the top of `src/esp32-Mouse-Jiggler.ino`.
