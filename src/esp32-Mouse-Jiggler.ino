@@ -165,12 +165,15 @@ static bool            gTimeUp       = false;
 static bool            gUsbWanted    = true;
 static bool            gTouchOk      = false;
 
+static uint32_t gHidTx = 0;
+
 static bool gPainted       = false;
 static bool gPaintEnabled  = false;
 static bool gPaintMoving   = false;
 static bool gPaintWanted   = false;
 static bool gPaintMounted  = false;
 static bool gPaintTouch    = false;
+static uint32_t gPaintTx   = 0;
 
 // ---------- Helpers ----------
 static float easeCosine01(float t) {
@@ -185,7 +188,33 @@ static int8_t satInt8(int value) {
 }
 
 static bool usbMounted() {
-  return static_cast<bool>(usbdev);
+  return tud_mounted();
+}
+
+// Queue one relative report. False means "try this same delta again":
+// the host has not accepted it yet, so the step must not be discarded.
+static bool sendDelta(int dx, int dy) {
+  if (dx == 0 && dy == 0) {
+    return true;
+  }
+  if (!gUsbWanted) {
+    return true;
+  }
+  if (!tud_mounted()) {
+    return false;
+  }
+  if (tud_suspended()) {
+    tud_remote_wakeup();
+    return false;
+  }
+  if (!tud_hid_n_ready(0)) {
+    return false;
+  }
+  if (!tud_hid_mouse_report(HID_REPORT_ID_MOUSE, 0, satInt8(dx), satInt8(dy), 0, 0)) {
+    return false;
+  }
+  gHidTx++;
+  return true;
 }
 
 static void seedRng() {
@@ -227,15 +256,12 @@ static void beginNudge() {
 static bool stepSessionIfDue() {
   const unsigned long now = millis();
 
-  if (gSession.i == 0) {
-    gSession.lastStepMs = now; // start immediately
+  // The first step must not stamp lastStepMs. Doing that while i is still 0
+  // resets the timer on every loop, so the interval never elapses and no
+  // HID report is ever queued.
+  if (gSession.i != 0 && (now - gSession.lastStepMs) < (unsigned long)kStepInterval) {
+    return true;
   }
-
-  if (now - gSession.lastStepMs < (unsigned long)kStepInterval) {
-    return true; // not time yet
-  }
-
-  gSession.lastStepMs = now;
 
   const int nextIndex = gSession.i + 1;
   const float t       = float(nextIndex) / float(gSession.steps);
@@ -247,10 +273,11 @@ static bool stepSessionIfDue() {
   const int dx = xPos - gSession.prevX;
   const int dy = yPos - gSession.prevY;
 
-  if ((dx != 0 || dy != 0) && gUsbWanted && usbMounted()) {
-    Mouse.move(satInt8(dx), satInt8(dy), 0, 0);
+  if (!sendDelta(dx, dy)) {
+    return true;
   }
 
+  gSession.lastStepMs = now;
   gSession.prevX = xPos;
   gSession.prevY = yPos;
   gSession.i     = nextIndex;
@@ -375,16 +402,17 @@ static void drawStatus(bool mounted, bool moving) {
     tft.setTextDatum(lgfx::top_left);
   }
 
+  char usbLine[40];
+  const char *usbState = !gUsbWanted ? "OFF" : (mounted ? "ON" : "WAIT");
+  snprintf(usbLine, sizeof(usbLine), "USB: %s  sent %lu", usbState, static_cast<unsigned long>(gHidTx));
   if (!gUsbWanted) {
     tft.setTextColor(TFT_RED, TFT_BLACK);
-    tft.drawString("USB: OFF", 8, 44);
   } else if (mounted) {
     tft.setTextColor(TFT_GREEN, TFT_BLACK);
-    tft.drawString("USB: ON", 8, 44);
   } else {
     tft.setTextColor(TFT_YELLOW, TFT_BLACK);
-    tft.drawString("USB: WAIT", 8, 44);
   }
+  tft.drawString(usbLine, 8, 44);
 
   if (!gTouchOk) {
     tft.setTextColor(TFT_YELLOW, TFT_BLACK);
@@ -396,7 +424,8 @@ static void refreshStatus() {
   const bool mounted = usbMounted();
   const bool moving  = gState == JiggleState::MOVING;
   if (gPainted && gPaintEnabled == gEnabled && gPaintMoving == moving &&
-      gPaintWanted == gUsbWanted && gPaintMounted == mounted && gPaintTouch == gTouchOk) {
+      gPaintWanted == gUsbWanted && gPaintMounted == mounted && gPaintTouch == gTouchOk &&
+      gPaintTx == gHidTx) {
     return;
   }
 
@@ -407,6 +436,7 @@ static void refreshStatus() {
   gPaintWanted  = gUsbWanted;
   gPaintMounted = mounted;
   gPaintTouch   = gTouchOk;
+  gPaintTx      = gHidTx;
 }
 
 static void onJiggle() {
@@ -492,9 +522,10 @@ void setup() {
   usbdev.PID(0x250E);
   usbdev.productName("Dell Laser Mouse MS3220");
   usbdev.manufacturerName("Dell");
+  usbdev.usbAttributes(static_cast<uint8_t>(TUSB_DESC_CONFIG_ATT_SELF_POWERED | TUSB_DESC_CONFIG_ATT_REMOTE_WAKEUP));
 
+  Mouse.begin();    // register HID before the device stack starts
   usbdev.begin();   // bring up TinyUSB device stack
-  Mouse.begin();    // start HID mouse
 
   seedRng();
 
