@@ -2,12 +2,15 @@
   ESP32-S3 “Mouse Jiggler” — HID over native USB (TinyUSB via Arduino-ESP32 3.x)
 
   What this sketch does:
-  • Enumerates as a USB mouse and performs a short eased mouse movement every
-    ~22–42 seconds for up to `kHoursToRun`, until the on-screen Jiggle button
-    stops it.
-  • Landscape touch UI on the ST7796: jiggler and USB status, plus Jiggle,
-    Nudge (100 px out and back on each axis), and USB disconnect/reconnect.
-  • Backlight stays on. The screen is the activity indicator.
+  • Enumerates as a USB mouse. While Jiggle is running, every ~22–42 seconds
+    it eases 10–40 px along one axis (+x, −x, +y, or −y), pauses briefly, then
+    eases back so the pointer ends where it started. This runs for up to
+    `kHoursToRun`, until the on-screen Jiggle button stops it.
+  • Landscape touch UI on the ST7796: Jiggle, Nudge (a 40 px square back to
+    the start), and USB. Status shows the next jiggle in 5 s steps, reports
+    sent with jiggles finished, and the nudge leg in progress.
+  • The touch key in the red circle under the glass toggles the backlight.
+    Jiggling continues while the panel is dark.
 
   Board: LilyGO T-Display-S3 Pro (PlatformIO, pioarduino / Arduino-ESP32 3.x)
     • env:jiggler        USB-OTG HID mouse, CDC off.
@@ -16,6 +19,8 @@
                          USB disconnect also drops that serial port.
 
   Touch: CST226SE at 0x5A, with CST816 at 0x15 as a fallback. Reset is GPIO13.
+  SY6970 at 0x6A shares that I2C bus. Startup turns off its STAT pin (the red
+  LED by RESET) and the charger watchdog that would turn the blink back on.
 
   based on https://github.com/rithwikmakesthings/esp32s3-Mouse-Jiggler/
 
@@ -83,16 +88,16 @@ ESPUSB usbdev;
 USBHIDMouse Mouse;
 
 // ---------- Tunables ----------
-static constexpr int   kMoveRangePx   = 100;   // |dx|, |dy| upper bound (pixels)
-static constexpr int   kMinPauseMs    = 22000; // idle window between bursts
-static constexpr int   kMaxPauseMs    = 42000;
-static constexpr int   kMinSteps      = 20;    // eased micro-steps per burst
-static constexpr int   kMaxSteps      = 30;
+static constexpr int   kJiggleMinPx   = 10;    // one-axis out-and-back distance
+static constexpr int   kJiggleMaxPx   = 20;
+static constexpr int   kJiggleMinSteps = 6;    // eased micro-steps per leg
+static constexpr int   kJiggleMaxSteps = 12;
+static constexpr int   kJiggleReverseDelayMs = 30; // pause at the far point before returning
+static constexpr int   kMinPauseMs    = 30000; // idle window between bursts
+static constexpr int   kMaxPauseMs    = 90000;
 static constexpr int   kStepInterval  = 5;     // ms between micro-steps
 static constexpr float kHoursToRun    = 8.0f;  // after this, unattended jiggling stops
-static constexpr int   kNudgePx       = 200;   // previous one-way diagonal, each axis
-static constexpr int   kNudgeLegPx    = kNudgePx / 2; // out, then back, so the pointer returns
-static constexpr int   kNudgeSteps    = 20;    // steps per leg; keeps each HID report inside int8
+static constexpr int   kMaxLegs       = 8;     // jiggle uses 2, nudge uses 7
 
 // ---------- Panel and touch ----------
 // Pro pins. Do not use the non-Pro variant macros (LCD_BL, SDA, GPIO15).
@@ -103,6 +108,10 @@ static constexpr int kTouchIrqPin  = 21;
 static constexpr int kTouchSdaPin  = 5;
 static constexpr int kTouchSclPin  = 6;
 static constexpr int kBacklightMax = 16; // V1.1 constant-current steps
+static constexpr uint8_t kPmuAddr  = 0x6A;
+static constexpr uint8_t kPmuReg07 = 0x07;
+static constexpr uint8_t kPmuStatDis = 1 << 6;      // REG07 bit 6, STAT pin off
+static constexpr uint8_t kPmuWatchdogMask = 0x30;   // REG07 bits 5:4
 
 static constexpr int kScreenW   = 480; // rotation 1 of the 222x480 panel
 static constexpr int kScreenH   = 222;
@@ -143,8 +152,17 @@ UiButton gBtnUsb;
 
 // ---------- State machine ----------
 enum class JiggleState : uint8_t { IDLE, MOVING };
+enum class MoveKind : uint8_t { JIGGLE, NUDGE };
 
 struct MovementSession {
+  int legDx[kMaxLegs] = {};
+  int legDy[kMaxLegs] = {};
+  int legSteps[kMaxLegs] = {};
+  int legCount = 0;
+  int legIndex = 0;
+  int gapMs = 0; // pause after a leg, before the next one
+  MoveKind kind = MoveKind::JIGGLE;
+
   int  totalDx = 0;
   int  totalDy = 0;
   int  steps   = 0;
@@ -154,8 +172,8 @@ struct MovementSession {
   int  i       = 0;
 
   unsigned long lastStepMs = 0;
-  bool outAndBack = false; // nudge: second leg reverses the first
-  bool returning  = false;
+  bool waitingForGap = false;
+  unsigned long legDoneMs = 0;
 };
 
 static JiggleState     gState        = JiggleState::IDLE;
@@ -166,16 +184,24 @@ static bool            gEnabled      = true;
 static bool            gTimeUp       = false;
 static bool            gUsbWanted    = true;
 static bool            gTouchOk      = false;
+static bool            gScreenOn     = true;
+static bool            gHomeSeen     = false;
+static bool            gHomeDown     = false;
+static unsigned long   gHomeBlockMs  = 0;
 
 static uint32_t gHidTx = 0;
+static uint32_t gJiggleCount = 0;
 
 static bool gPainted       = false;
 static bool gPaintEnabled  = false;
-static bool gPaintMoving   = false;
 static bool gPaintWanted   = false;
 static bool gPaintMounted  = false;
 static bool gPaintTouch    = false;
 static uint32_t gPaintTx   = 0;
+static uint32_t gPaintJiggles = 0;
+static int gPaintCountdown = -1;
+static int gPaintLeg       = -1;
+static MoveKind gPaintKind = MoveKind::JIGGLE;
 
 // ---------- Helpers ----------
 static float easeCosine01(float t) {
@@ -231,35 +257,74 @@ static void scheduleNextIdleWindow() {
   gNextActionMs = millis() + (unsigned long)random(kMinPauseMs, kMaxPauseMs);
 }
 
-static void beginSession(int totalDx, int totalDy, int steps) {
-  gSession.totalDx = totalDx;
-  gSession.totalDy = totalDy;
-  gSession.steps   = steps;
+static void loadLeg(int index) {
+  gSession.totalDx = gSession.legDx[index];
+  gSession.totalDy = gSession.legDy[index];
+  gSession.steps   = gSession.legSteps[index];
 
   gSession.prevX = 0;
   gSession.prevY = 0;
   gSession.i     = 0;
   gSession.lastStepMs = 0;
-  gSession.outAndBack = false;
-  gSession.returning  = false;
+  gSession.waitingForGap = false;
+}
 
+static void beginLegs(const int *dx, const int *dy, const int *steps, int count, int gapMs, MoveKind kind) {
+  if (count > kMaxLegs) {
+    count = kMaxLegs;
+  }
+  gSession.legCount = count;
+  gSession.legIndex = 0;
+  gSession.gapMs = gapMs;
+  gSession.kind = kind;
+  for (int i = 0; i < count; i++) {
+    gSession.legDx[i] = dx[i];
+    gSession.legDy[i] = dy[i];
+    gSession.legSteps[i] = steps[i];
+  }
+  loadLeg(0);
   gState = JiggleState::MOVING;
 }
 
 static void beginRandomSession() {
-  beginSession(
-      random(-kMoveRangePx, kMoveRangePx + 1),
-      random(-kMoveRangePx, kMoveRangePx + 1),
-      random(kMinSteps, kMaxSteps + 1));
+  const int distance = random(kJiggleMinPx, kJiggleMaxPx + 1);
+  static constexpr int kAxis[4][2] = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
+  const int axis = random(4);
+  const int dx = kAxis[axis][0] * distance;
+  const int dy = kAxis[axis][1] * distance;
+  const int span = kJiggleMaxPx - kJiggleMinPx;
+  const int steps = kJiggleMinSteps
+      + (distance - kJiggleMinPx) * (kJiggleMaxSteps - kJiggleMinSteps) / span;
+
+  const int legDx[2] = {dx, -dx};
+  const int legDy[2] = {dy, -dy};
+  const int legSteps[2] = {steps, steps};
+  beginLegs(legDx, legDy, legSteps, 2, kJiggleReverseDelayMs, MoveKind::JIGGLE);
 }
 
+// Host axes: +x right, +y down. 40 px square centered on the start.
+// The sixth leg is left. Right would finish 40 px off the start.
+static constexpr int kNudgeDx[] = {0, -20, 0, 40, 0, -20, 0};
+static constexpr int kNudgeDy[] = {-20, 0, 40, 0, -40, 0, 20};
+
 static void beginNudge() {
-  beginSession(kNudgeLegPx, kNudgeLegPx, kNudgeSteps);
-  gSession.outAndBack = true;
+  int steps[7];
+  for (int i = 0; i < 7; i++) {
+    steps[i] = (abs(kNudgeDx[i]) + abs(kNudgeDy[i])) / 2;
+  }
+  beginLegs(kNudgeDx, kNudgeDy, steps, 7, 0, MoveKind::NUDGE);
 }
 
 static bool stepSessionIfDue() {
   const unsigned long now = millis();
+
+  if (gSession.waitingForGap) {
+    if ((now - gSession.legDoneMs) < (unsigned long)gSession.gapMs) {
+      return true;
+    }
+    gSession.legIndex++;
+    loadLeg(gSession.legIndex);
+  }
 
   // The first step must not stamp lastStepMs. Doing that while i is still 0
   // resets the timer on every loop, so the interval never elapses and no
@@ -288,14 +353,18 @@ static bool stepSessionIfDue() {
   gSession.i     = nextIndex;
 
   if (gSession.i >= gSession.steps) {
-    if (gSession.outAndBack && !gSession.returning) {
-      const int backDx = -gSession.totalDx;
-      const int backDy = -gSession.totalDy;
-      const int steps  = gSession.steps;
-      beginSession(backDx, backDy, steps);
-      gSession.outAndBack = true;
-      gSession.returning  = true;
+    if (gSession.legIndex + 1 < gSession.legCount) {
+      if (gSession.gapMs > 0) {
+        gSession.waitingForGap = true;
+        gSession.legDoneMs = now;
+        return true;
+      }
+      gSession.legIndex++;
+      loadLeg(gSession.legIndex);
       return true;
+    }
+    if (gSession.kind == MoveKind::JIGGLE) {
+      gJiggleCount++;
     }
     gState = JiggleState::IDLE;
     scheduleNextIdleWindow();
@@ -346,6 +415,13 @@ static void initPanel() {
   setBacklight(kBacklightMax);
 }
 
+// CST226 reports the red-circle key as its own packet. getPoint invokes this
+// once per read while that packet is present, the same hook the Cellphone
+// example uses.
+static void onHomeButton(void *) {
+  gHomeSeen = true;
+}
+
 static void initTouch() {
   pinMode(kTouchResPin, OUTPUT);
   digitalWrite(kTouchResPin, LOW);
@@ -365,6 +441,28 @@ static void initTouch() {
   touch.setMaxCoordinates(kScreenW, kScreenH);
   touch.setSwapXY(true);
   touch.setMirrorXY(false, true);
+  touch.setHomeButtonCallback(onHomeButton, nullptr);
+}
+
+// The red LED by RESET is the charger STAT pin. It blinks when USB is
+// present and no battery is connected. Bit 6 of REG07 turns the pin off.
+// The watchdog, bits 5:4, reloads the power-on defaults after 40 s, which
+// would light the LED again, so those bits are cleared in the same write.
+static void muteChargeLed() {
+  Wire.beginTransmission(kPmuAddr);
+  Wire.write(kPmuReg07);
+  if (Wire.endTransmission(false) != 0) {
+    return;
+  }
+  if (Wire.requestFrom(kPmuAddr, static_cast<uint8_t>(1)) != 1) {
+    return;
+  }
+  const uint8_t value = (Wire.read() | kPmuStatDis) & ~kPmuWatchdogMask;
+
+  Wire.beginTransmission(kPmuAddr);
+  Wire.write(kPmuReg07);
+  Wire.write(value);
+  Wire.endTransmission();
 }
 
 static void initButton(UiButton &btn, int16_t centerX, const char *label, uint16_t fill) {
@@ -395,7 +493,81 @@ static void drawButtons() {
   drawButton(gBtnUsb, false);
 }
 
-static void drawStatus(bool mounted, bool moving) {
+static void setScreen(bool on) {
+  if (on == gScreenOn) {
+    return;
+  }
+  gScreenOn = on;
+  gPainted = false;
+  if (!on) {
+    setBacklight(0);
+    tft.fillScreen(TFT_BLACK);
+    return;
+  }
+  setBacklight(kBacklightMax);
+  drawButtons();
+}
+
+static bool jiggleMoving() {
+  return gState == JiggleState::MOVING && gSession.kind == MoveKind::JIGGLE;
+}
+
+static bool nudgeMoving() {
+  return gState == JiggleState::MOVING && gSession.kind == MoveKind::NUDGE;
+}
+
+// Remaining time until the next jiggle, rounded up to a 5 s step.
+// 22 s left shows "next 25s"; the label changes when that step changes.
+static int nextJiggleBucketSec() {
+  const unsigned long now = millis();
+  if (now >= gNextActionMs) {
+    return 0;
+  }
+  const unsigned long remainSec = (gNextActionMs - now + 999UL) / 1000UL;
+  return static_cast<int>(((remainSec + 4UL) / 5UL) * 5UL);
+}
+
+static int statusCountdownSec() {
+  if (!gEnabled || jiggleMoving()) {
+    return -1;
+  }
+  const int bucket = nextJiggleBucketSec();
+  return bucket > 0 ? bucket : -1;
+}
+
+// Font2 has no triangle glyphs. The mark stands in for ▴ ▾ ◂ ▸.
+static int drawDirectionMark(int x, int top, int dx, int dy, uint16_t color) {
+  const int size = 6;
+  const int cx = x + 8;
+  const int cy = top + 8;
+  if (dy < 0) {
+    tft.fillTriangle(cx, cy - size, cx - size, cy + size, cx + size, cy + size, color);
+  } else if (dy > 0) {
+    tft.fillTriangle(cx, cy + size, cx - size, cy - size, cx + size, cy - size, color);
+  } else if (dx < 0) {
+    tft.fillTriangle(cx - size, cy, cx + size, cy - size, cx + size, cy + size, color);
+  } else if (dx > 0) {
+    tft.fillTriangle(cx + size, cy, cx - size, cy - size, cx - size, cy + size, color);
+  }
+  return 16;
+}
+
+static void drawNudgeLeg() {
+  const int dx = gSession.totalDx;
+  const int dy = gSession.totalDy;
+  const int distance = abs(dx) + abs(dy);
+  const uint16_t color = TFT_WHITE;
+  tft.setTextColor(color, TFT_BLACK);
+  int x = 8;
+  x += tft.drawString("nudge:", x, 72);
+  x += 6;
+  x += drawDirectionMark(x, 72, dx, dy, color);
+  char detail[24];
+  snprintf(detail, sizeof(detail), "%dpx (%d/%d)", distance, gSession.legIndex + 1, gSession.legCount);
+  tft.drawString(detail, x + 4, 72);
+}
+
+static void drawStatus(bool mounted, int countdownSec) {
   tft.fillRect(0, 0, kScreenW, kStatusH, TFT_BLACK);
   tft.setFont(&fonts::Font2);
   tft.setTextSize(1);
@@ -409,16 +581,26 @@ static void drawStatus(bool mounted, bool moving) {
     tft.drawString("Jiggler: STOP", 8, 16);
   }
 
-  if (moving) {
+  if (jiggleMoving()) {
     tft.setTextDatum(lgfx::top_right);
     tft.setTextColor(TFT_YELLOW, TFT_BLACK);
     tft.drawString("MOVE", kScreenW - 8, 16);
     tft.setTextDatum(lgfx::top_left);
+  } else if (countdownSec > 0) {
+    char countdown[16];
+    snprintf(countdown, sizeof(countdown), "next %ds", countdownSec);
+    tft.setTextDatum(lgfx::top_right);
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.drawString(countdown, kScreenW - 8, 16);
+    tft.setTextDatum(lgfx::top_left);
   }
 
-  char usbLine[40];
+  char usbLine[48];
   const char *usbState = !gUsbWanted ? "OFF" : (mounted ? "ON" : "WAIT");
-  snprintf(usbLine, sizeof(usbLine), "USB: %s  sent %lu", usbState, static_cast<unsigned long>(gHidTx));
+  snprintf(usbLine, sizeof(usbLine), "USB: %s  sent %lu (%lu)",
+           usbState,
+           static_cast<unsigned long>(gHidTx),
+           static_cast<unsigned long>(gJiggleCount));
   if (!gUsbWanted) {
     tft.setTextColor(TFT_RED, TFT_BLACK);
   } else if (mounted) {
@@ -428,29 +610,46 @@ static void drawStatus(bool mounted, bool moving) {
   }
   tft.drawString(usbLine, 8, 44);
 
+  if (nudgeMoving()) {
+    drawNudgeLeg();
+  }
   if (!gTouchOk) {
     tft.setTextColor(TFT_YELLOW, TFT_BLACK);
-    tft.drawString("No touch", 8, 72);
+    if (nudgeMoving()) {
+      tft.setTextDatum(lgfx::top_right);
+      tft.drawString("No touch", kScreenW - 8, 72);
+      tft.setTextDatum(lgfx::top_left);
+    } else {
+      tft.drawString("No touch", 8, 72);
+    }
   }
 }
 
 static void refreshStatus() {
+  if (!gScreenOn) {
+    return;
+  }
   const bool mounted = usbMounted();
-  const bool moving  = gState == JiggleState::MOVING;
-  if (gPainted && gPaintEnabled == gEnabled && gPaintMoving == moving &&
-      gPaintWanted == gUsbWanted && gPaintMounted == mounted && gPaintTouch == gTouchOk &&
-      gPaintTx == gHidTx) {
+  const int countdown = statusCountdownSec();
+  const int leg = (gState == JiggleState::MOVING) ? gSession.legIndex : -1;
+  if (gPainted && gPaintEnabled == gEnabled && gPaintWanted == gUsbWanted &&
+      gPaintMounted == mounted && gPaintTouch == gTouchOk && gPaintTx == gHidTx &&
+      gPaintCountdown == countdown && gPaintJiggles == gJiggleCount &&
+      gPaintLeg == leg && gPaintKind == gSession.kind) {
     return;
   }
 
-  drawStatus(mounted, moving);
-  gPainted      = true;
-  gPaintEnabled = gEnabled;
-  gPaintMoving  = moving;
-  gPaintWanted  = gUsbWanted;
-  gPaintMounted = mounted;
-  gPaintTouch   = gTouchOk;
-  gPaintTx      = gHidTx;
+  drawStatus(mounted, countdown);
+  gPainted        = true;
+  gPaintEnabled   = gEnabled;
+  gPaintWanted    = gUsbWanted;
+  gPaintMounted   = mounted;
+  gPaintTouch     = gTouchOk;
+  gPaintTx        = gHidTx;
+  gPaintJiggles   = gJiggleCount;
+  gPaintCountdown = countdown;
+  gPaintLeg       = leg;
+  gPaintKind      = gSession.kind;
 }
 
 static void onJiggle() {
@@ -489,14 +688,42 @@ static void serviceButton(UiButton &btn, bool down, int16_t x, int16_t y, void (
   }
 }
 
+// One toggle per press. The controller repeats the home packet while the
+// key is down, and a 200 ms lockout covers a burst that drops out briefly.
+static void noteHomeButton() {
+  if (!gHomeSeen) {
+    gHomeDown = false;
+    return;
+  }
+  if (gHomeDown) {
+    return;
+  }
+  gHomeDown = true;
+  const unsigned long now = millis();
+  if (now < gHomeBlockMs) {
+    return;
+  }
+  gHomeBlockMs = now + 200;
+  setScreen(!gScreenOn);
+}
+
 static void pollTouch() {
   if (!gTouchOk) {
     return;
   }
 
+  gHomeSeen = false;
   int16_t x = -1;
   int16_t y = -1;
   const bool down = touch.getPoint(&x, &y, 1) > 0;
+  noteHomeButton();
+
+  if (!gScreenOn) {
+    gBtnJiggle.press(false);
+    gBtnNudge.press(false);
+    gBtnUsb.press(false);
+    return;
+  }
 
   serviceButton(gBtnJiggle, down, x, y, onJiggle);
   serviceButton(gBtnNudge, down, x, y, onNudge);
@@ -523,6 +750,7 @@ static void enforceRuntimeLimit() {
 void setup() {
   initPanel();
   initTouch();
+  muteChargeLed();
 
   const int buttonX0 = kButtonGap + (kButtonW / 2);
   initButton(gBtnJiggle, buttonX0, "Jiggle", TFT_DARKGREEN);
