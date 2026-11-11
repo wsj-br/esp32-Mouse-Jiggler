@@ -6,7 +6,7 @@
     ~22–42 seconds for up to `kHoursToRun`, until the on-screen Jiggle button
     stops it.
   • Landscape touch UI on the ST7796: jiggler and USB status, plus Jiggle,
-    Nudge (+200,+200), and USB disconnect/reconnect.
+    Nudge (100 px out and back on each axis), and USB disconnect/reconnect.
   • Backlight stays on. The screen is the activity indicator.
 
   Board: LilyGO T-Display-S3 Pro (PlatformIO, pioarduino / Arduino-ESP32 3.x)
@@ -91,8 +91,9 @@ static constexpr int   kMinSteps      = 20;    // eased micro-steps per burst
 static constexpr int   kMaxSteps      = 30;
 static constexpr int   kStepInterval  = 5;     // ms between micro-steps
 static constexpr float kHoursToRun    = 8.0f;  // after this, unattended jiggling stops
-static constexpr int   kNudgePx       = 200;   // diagonal nudge, each axis
-static constexpr int   kNudgeSteps    = 20;    // keeps each HID report inside int8
+static constexpr int   kNudgePx       = 200;   // previous one-way diagonal, each axis
+static constexpr int   kNudgeLegPx    = kNudgePx / 2; // out, then back, so the pointer returns
+static constexpr int   kNudgeSteps    = 20;    // steps per leg; keeps each HID report inside int8
 
 // ---------- Panel and touch ----------
 // Pro pins. Do not use the non-Pro variant macros (LCD_BL, SDA, GPIO15).
@@ -154,6 +155,8 @@ struct MovementSession {
   int  i       = 0;
 
   unsigned long lastStepMs = 0;
+  bool outAndBack = false; // nudge: second leg reverses the first
+  bool returning  = false;
 };
 
 static JiggleState     gState        = JiggleState::IDLE;
@@ -238,6 +241,8 @@ static void beginSession(int totalDx, int totalDy, int steps) {
   gSession.prevY = 0;
   gSession.i     = 0;
   gSession.lastStepMs = 0;
+  gSession.outAndBack = false;
+  gSession.returning  = false;
 
   gState = JiggleState::MOVING;
 }
@@ -250,7 +255,8 @@ static void beginRandomSession() {
 }
 
 static void beginNudge() {
-  beginSession(kNudgePx, kNudgePx, kNudgeSteps);
+  beginSession(kNudgeLegPx, kNudgeLegPx, kNudgeSteps);
+  gSession.outAndBack = true;
 }
 
 static bool stepSessionIfDue() {
@@ -283,6 +289,15 @@ static bool stepSessionIfDue() {
   gSession.i     = nextIndex;
 
   if (gSession.i >= gSession.steps) {
+    if (gSession.outAndBack && !gSession.returning) {
+      const int backDx = -gSession.totalDx;
+      const int backDy = -gSession.totalDy;
+      const int steps  = gSession.steps;
+      beginSession(backDx, backDy, steps);
+      gSession.outAndBack = true;
+      gSession.returning  = true;
+      return true;
+    }
     gState = JiggleState::IDLE;
     scheduleNextIdleWindow();
     return false;
