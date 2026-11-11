@@ -1,0 +1,22 @@
+---
+description: LilyGO T-Display-S3 Pro pinout, USB mode, and build environments
+alwaysApply: true
+---
+
+# LilyGO T-Display-S3 Pro
+
+ESP32-S3R8, 16MB flash, 8MB OPI PSRAM, ST7796 222x480 over SPI. Build with PlatformIO on the pioarduino Arduino-ESP32 3.x platform. Board id `lilygo-t-display-s3` (same module; the variant pin macros are the non-Pro board).
+
+`USB.h` and `USBHIDMouse.h` compile only with `ARDUINO_USB_MODE=0` (USB-OTG). The board manifest sets mode 1 (Hardware CDC); do not put that back.
+
+- `jiggler`: HID only, CDC off. Reflash by holding BOOT, tapping RESET, then releasing BOOT.
+- `jiggler-debug`: HID plus CDC at 115200, so upload can auto-reset. The host sees a composite device.
+
+Reserved pins:
+
+- TFT SPI: SCK GPIO18, MOSI GPIO17, MISO GPIO8, CS GPIO39, DC GPIO9, RST GPIO47
+- Backlight: GPIO48. V1.1 is a 16-step constant-current driver. V1.0 is PWM.
+- SD card shares the SPI bus, CS GPIO14. Hold it high when the card is unused.
+- Touch and SY6970 PMU share I2C: SDA GPIO5, SCL GPIO6. Touch reset GPIO13, IRQ GPIO21.
+- Buttons: GPIO0 (BOOT), GPIO12, GPIO16
+- GPIO15 is a camera pin, not panel power.
