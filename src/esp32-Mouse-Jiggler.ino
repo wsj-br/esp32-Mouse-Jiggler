@@ -2,10 +2,10 @@
   ESP32-S3 “Mouse Jiggler” — HID over native USB (TinyUSB via Arduino-ESP32 3.x)
 
   What this sketch does:
-  • Enumerates as a USB mouse. While Jiggle is running, every ~22–42 seconds
-    it eases 10–40 px along one axis (+x, −x, +y, or −y), pauses briefly, then
+  • Enumerates as a USB mouse. While the timer is running, every ~30–90 seconds
+    it eases 10–20 px along one axis (+x, −x, +y, or −y), pauses briefly, then
     eases back so the pointer ends where it started. This runs for up to
-    `kHoursToRun`, until the on-screen Jiggle button stops it.
+    `kHoursToRun`. The Jiggle button runs one of those moves immediately.
   • Landscape touch UI on the ST7796: Jiggle, Nudge (a 40 px square back to
     the start), and USB. Status shows the next jiggle in 5 s steps, reports
     sent with jiggles finished, and the nudge leg in progress.
@@ -95,7 +95,7 @@ static constexpr int   kJiggleMaxSteps = 12;
 static constexpr int   kJiggleReverseDelayMs = 30; // pause at the far point before returning
 static constexpr int   kMinPauseMs    = 30000; // idle window between bursts
 static constexpr int   kMaxPauseMs    = 90000;
-static constexpr int   kStepInterval  = 5;     // ms between micro-steps
+static constexpr int   kStepInterval  = 10;     // ms between micro-steps
 static constexpr float kHoursToRun    = 8.0f;  // after this, unattended jiggling stops
 static constexpr int   kMaxLegs       = 8;     // jiggle uses 2, nudge uses 7
 
@@ -115,7 +115,6 @@ static constexpr uint8_t kPmuWatchdogMask = 0x30;   // REG07 bits 5:4
 
 static constexpr int kScreenW   = 480; // rotation 1 of the 222x480 panel
 static constexpr int kScreenH   = 222;
-static constexpr int kStatusH   = 110;
 static constexpr int kButtonW   = 140;
 static constexpr int kButtonH   = 72;
 static constexpr int kButtonGap = (kScreenW - 3 * kButtonW) / 4;
@@ -192,16 +191,29 @@ static unsigned long   gHomeBlockMs  = 0;
 static uint32_t gHidTx = 0;
 static uint32_t gJiggleCount = 0;
 
-static bool gPainted       = false;
-static bool gPaintEnabled  = false;
-static bool gPaintWanted   = false;
-static bool gPaintMounted  = false;
-static bool gPaintTouch    = false;
-static uint32_t gPaintTx   = 0;
-static uint32_t gPaintJiggles = 0;
-static int gPaintCountdown = -1;
-static int gPaintLeg       = -1;
-static MoveKind gPaintKind = MoveKind::JIGGLE;
+// Last text actually on the glass. Refresh rewrites only the characters that
+// changed, so a ticking counter does not black out the other status lines.
+struct TextField {
+  char text[64];
+  uint16_t color;
+  int x;
+  int y;
+  int width;
+  bool valid;
+};
+
+static TextField gFieldMode;
+static TextField gFieldBadge;
+static TextField gFieldUsb;
+static TextField gFieldNudge;
+static TextField gFieldNudgePx;
+static TextField gFieldTouch;
+
+static int gMarkX = 0;
+static int gMarkY = 0;
+static int gMarkDx = 0;
+static int gMarkDy = 0;
+static bool gMarkOn = false;
 
 // ---------- Helpers ----------
 static float easeCosine01(float t) {
@@ -493,18 +505,29 @@ static void drawButtons() {
   drawButton(gBtnUsb, false);
 }
 
+static void invalidateStatus() {
+  gFieldMode.valid = false;
+  gFieldBadge.valid = false;
+  gFieldUsb.valid = false;
+  gFieldNudge.valid = false;
+  gFieldNudgePx.valid = false;
+  gFieldTouch.valid = false;
+  gMarkOn = false;
+}
+
 static void setScreen(bool on) {
   if (on == gScreenOn) {
     return;
   }
   gScreenOn = on;
-  gPainted = false;
   if (!on) {
     setBacklight(0);
     tft.fillScreen(TFT_BLACK);
     return;
   }
+  // The panel was cleared while it was off, so every line has to be drawn again.
   setBacklight(kBacklightMax);
+  invalidateStatus();
   drawButtons();
 }
 
@@ -552,47 +575,195 @@ static int drawDirectionMark(int x, int top, int dx, int dy, uint16_t color) {
   return 16;
 }
 
-static void drawNudgeLeg() {
-  const int dx = gSession.totalDx;
-  const int dy = gSession.totalDy;
-  const int distance = abs(dx) + abs(dy);
-  const uint16_t color = TFT_WHITE;
-  tft.setTextColor(color, TFT_BLACK);
-  int x = 8;
-  x += tft.drawString("nudge:", x, 72);
-  x += 6;
-  x += drawDirectionMark(x, 72, dx, dy, color);
-  char detail[24];
-  snprintf(detail, sizeof(detail), "%dpx (%d/%d)", distance, gSession.legIndex + 1, gSession.legCount);
-  tft.drawString(detail, x + 4, 72);
+static void eraseField(const TextField &field) {
+  if (!field.valid || field.width <= 0) {
+    return;
+  }
+  tft.setFont(&fonts::Font2);
+  tft.setTextSize(1);
+  tft.fillRect(field.x, field.y, field.width, tft.fontHeight(), TFT_BLACK);
 }
 
-static void drawStatus(bool mounted, int countdownSec) {
-  tft.fillRect(0, 0, kScreenW, kStatusH, TFT_BLACK);
+static void storeField(TextField &field, const char *text, uint16_t color, int x, int y, int width) {
+  strncpy(field.text, text, sizeof(field.text) - 1);
+  field.text[sizeof(field.text) - 1] = '\0';
+  field.color = color;
+  field.x = x;
+  field.y = y;
+  field.width = width;
+  field.valid = true;
+}
+
+static int sharedPrefix(const char *prev, const char *next) {
+  int i = 0;
+  while (prev[i] != '\0' && prev[i] == next[i]) {
+    i++;
+  }
+  return i;
+}
+
+// Draw over the previous string. Glyphs carry their own background, so the
+// line is never cleared first. A shorter replacement erases only its leftover tail.
+static void paintLeft(TextField &field, const char *text, uint16_t color, int x, int y) {
+  if (field.valid && field.x == x && field.y == y && field.color == color &&
+      strcmp(field.text, text) == 0) {
+    return;
+  }
+
   tft.setFont(&fonts::Font2);
   tft.setTextSize(1);
   tft.setTextDatum(lgfx::top_left);
+  const int lineH = tft.fontHeight();
+
+  if (field.valid && (field.x != x || field.y != y)) {
+    eraseField(field);
+    field.valid = false;
+    field.width = 0;
+    field.text[0] = '\0';
+  }
+
+  if (text[0] == '\0') {
+    if (field.valid && field.width > 0) {
+      tft.fillRect(field.x, field.y, field.width, lineH, TFT_BLACK);
+    }
+    storeField(field, "", color, x, y, 0);
+    return;
+  }
+
+  tft.setTextColor(color, TFT_BLACK);
+  const bool canPatch = field.valid && field.color == color;
+  const int skip = canPatch ? sharedPrefix(field.text, text) : 0;
+
+  int headW = 0;
+  if (skip > 0) {
+    char head[64];
+    memcpy(head, text, static_cast<size_t>(skip));
+    head[skip] = '\0';
+    headW = tft.textWidth(head);
+  }
+
+  int drawn = 0;
+  if (text[skip] != '\0') {
+    drawn = tft.drawString(text + skip, x + headW, y);
+  }
+  const int totalW = headW + drawn;
+  if (field.valid && field.width > totalW) {
+    tft.fillRect(x + totalW, y, field.width - totalW, lineH, TFT_BLACK);
+  }
+  storeField(field, text, color, x, y, totalW);
+}
+
+static void paintRight(TextField &field, const char *text, uint16_t color, int right, int y) {
+  if (field.valid && field.y == y && field.color == color && strcmp(field.text, text) == 0) {
+    return;
+  }
+
+  tft.setFont(&fonts::Font2);
+  tft.setTextSize(1);
+  tft.setTextDatum(lgfx::top_left);
+  const int lineH = tft.fontHeight();
+  const int width = text[0] != '\0' ? tft.textWidth(text) : 0;
+  const int x = right - width;
+
+  if (field.valid && field.y == y) {
+    const int oldL = field.x;
+    const int oldR = field.x + field.width;
+    if (oldL < x) {
+      tft.fillRect(oldL, y, x - oldL, lineH, TFT_BLACK);
+    }
+    if (oldR > x + width) {
+      tft.fillRect(x + width, y, oldR - (x + width), lineH, TFT_BLACK);
+    }
+  } else if (field.valid) {
+    eraseField(field);
+  }
+
+  if (width > 0) {
+    tft.setTextColor(color, TFT_BLACK);
+    tft.drawString(text, x, y);
+  }
+  storeField(field, text, color, x, y, width);
+}
+
+static void hideDirection() {
+  if (!gMarkOn) {
+    return;
+  }
+  tft.fillRect(gMarkX, gMarkY, 16, 16, TFT_BLACK);
+  gMarkOn = false;
+}
+
+static void paintDirection(int x, int y, int dx, int dy) {
+  if (gMarkOn && gMarkX == x && gMarkY == y && gMarkDx == dx && gMarkDy == dy) {
+    return;
+  }
+  if (gMarkOn) {
+    tft.fillRect(gMarkX, gMarkY, 16, 16, TFT_BLACK);
+  }
+  drawDirectionMark(x, y, dx, dy, TFT_WHITE);
+  gMarkX = x;
+  gMarkY = y;
+  gMarkDx = dx;
+  gMarkDy = dy;
+  gMarkOn = true;
+}
+
+static void paintActivity() {
+  const int y = 72;
+
+  // Move the touch warning off the left edge before the nudge label lands there.
+  if (!gTouchOk && nudgeMoving()) {
+    paintRight(gFieldTouch, "No touch", TFT_YELLOW, kScreenW - 8, y);
+  }
+
+  if (nudgeMoving()) {
+    paintLeft(gFieldNudge, "nudge:", TFT_WHITE, 8, y);
+    const int markX = 8 + gFieldNudge.width + 6;
+    paintDirection(markX, y, gSession.totalDx, gSession.totalDy);
+    char detail[24];
+    const int distance = abs(gSession.totalDx) + abs(gSession.totalDy);
+    snprintf(detail, sizeof(detail), "%dpx (%d/%d)",
+             distance, gSession.legIndex + 1, gSession.legCount);
+    paintLeft(gFieldNudgePx, detail, TFT_WHITE, markX + 16 + 4, y);
+  } else {
+    paintLeft(gFieldNudge, "", TFT_WHITE, 8, y);
+    hideDirection();
+    if (gFieldNudgePx.valid) {
+      paintLeft(gFieldNudgePx, "", TFT_WHITE, gFieldNudgePx.x, gFieldNudgePx.y);
+    }
+  }
+
+  if (!gTouchOk && !nudgeMoving()) {
+    paintLeft(gFieldTouch, "No touch", TFT_YELLOW, 8, y);
+  } else if (gTouchOk && gFieldTouch.valid && gFieldTouch.width > 0) {
+    paintLeft(gFieldTouch, "", gFieldTouch.color, gFieldTouch.x, gFieldTouch.y);
+  }
+}
+
+static void refreshStatus() {
+  if (!gScreenOn) {
+    return;
+  }
+
+  const bool mounted = usbMounted();
+  const int countdown = statusCountdownSec();
+
+  tft.startWrite();
 
   if (gEnabled) {
-    tft.setTextColor(TFT_GREEN, TFT_BLACK);
-    tft.drawString("Jiggler: RUN", 8, 16);
+    paintLeft(gFieldMode, "Jiggler: RUN", TFT_GREEN, 8, 16);
   } else {
-    tft.setTextColor(TFT_RED, TFT_BLACK);
-    tft.drawString("Jiggler: STOP", 8, 16);
+    paintLeft(gFieldMode, "Jiggler: STOP", TFT_RED, 8, 16);
   }
 
   if (jiggleMoving()) {
-    tft.setTextDatum(lgfx::top_right);
-    tft.setTextColor(TFT_YELLOW, TFT_BLACK);
-    tft.drawString("MOVE", kScreenW - 8, 16);
-    tft.setTextDatum(lgfx::top_left);
-  } else if (countdownSec > 0) {
-    char countdown[16];
-    snprintf(countdown, sizeof(countdown), "next %ds", countdownSec);
-    tft.setTextDatum(lgfx::top_right);
-    tft.setTextColor(TFT_WHITE, TFT_BLACK);
-    tft.drawString(countdown, kScreenW - 8, 16);
-    tft.setTextDatum(lgfx::top_left);
+    paintRight(gFieldBadge, "MOVE", TFT_YELLOW, kScreenW - 8, 16);
+  } else if (countdown > 0) {
+    char countdownText[16];
+    snprintf(countdownText, sizeof(countdownText), "next %ds", countdown);
+    paintRight(gFieldBadge, countdownText, TFT_WHITE, kScreenW - 8, 16);
+  } else {
+    paintRight(gFieldBadge, "", TFT_WHITE, kScreenW - 8, 16);
   }
 
   char usbLine[48];
@@ -601,68 +772,21 @@ static void drawStatus(bool mounted, int countdownSec) {
            usbState,
            static_cast<unsigned long>(gHidTx),
            static_cast<unsigned long>(gJiggleCount));
+  uint16_t usbColor = TFT_YELLOW;
   if (!gUsbWanted) {
-    tft.setTextColor(TFT_RED, TFT_BLACK);
+    usbColor = TFT_RED;
   } else if (mounted) {
-    tft.setTextColor(TFT_GREEN, TFT_BLACK);
-  } else {
-    tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+    usbColor = TFT_GREEN;
   }
-  tft.drawString(usbLine, 8, 44);
+  paintLeft(gFieldUsb, usbLine, usbColor, 8, 44);
 
-  if (nudgeMoving()) {
-    drawNudgeLeg();
-  }
-  if (!gTouchOk) {
-    tft.setTextColor(TFT_YELLOW, TFT_BLACK);
-    if (nudgeMoving()) {
-      tft.setTextDatum(lgfx::top_right);
-      tft.drawString("No touch", kScreenW - 8, 72);
-      tft.setTextDatum(lgfx::top_left);
-    } else {
-      tft.drawString("No touch", 8, 72);
-    }
-  }
+  paintActivity();
+  tft.endWrite();
 }
 
-static void refreshStatus() {
-  if (!gScreenOn) {
-    return;
-  }
-  const bool mounted = usbMounted();
-  const int countdown = statusCountdownSec();
-  const int leg = (gState == JiggleState::MOVING) ? gSession.legIndex : -1;
-  if (gPainted && gPaintEnabled == gEnabled && gPaintWanted == gUsbWanted &&
-      gPaintMounted == mounted && gPaintTouch == gTouchOk && gPaintTx == gHidTx &&
-      gPaintCountdown == countdown && gPaintJiggles == gJiggleCount &&
-      gPaintLeg == leg && gPaintKind == gSession.kind) {
-    return;
-  }
-
-  drawStatus(mounted, countdown);
-  gPainted        = true;
-  gPaintEnabled   = gEnabled;
-  gPaintWanted    = gUsbWanted;
-  gPaintMounted   = mounted;
-  gPaintTouch     = gTouchOk;
-  gPaintTx        = gHidTx;
-  gPaintJiggles   = gJiggleCount;
-  gPaintCountdown = countdown;
-  gPaintLeg       = leg;
-  gPaintKind      = gSession.kind;
-}
-
+// One out-and-back move, right now. The idle timer is left alone.
 static void onJiggle() {
-  gEnabled = !gEnabled;
-  if (gEnabled) {
-    if (gTimeUp) {
-      gTimeUp  = false;
-      gStartMs = millis();
-    }
-    scheduleNextIdleWindow();
-  } else if (gState == JiggleState::MOVING) {
-    gState = JiggleState::IDLE;
-  }
+  beginRandomSession();
 }
 
 static void onNudge() {
